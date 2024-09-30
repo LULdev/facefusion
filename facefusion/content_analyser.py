@@ -1,56 +1,64 @@
-from typing import Any, Dict
 from functools import lru_cache
-import threading
+
 import cv2
 import numpy
-import onnxruntime
 from tqdm import tqdm
 
-import facefusion.globals
-from facefusion import wording
-from facefusion.typing import VisionFrame, ModelValue, Fps
-from facefusion.execution_helper import apply_execution_provider_options
-from facefusion.vision import get_video_frame, count_video_frame_total, read_image, detect_video_fps
+from facefusion import inference_manager, state_manager, wording
+from facefusion.download import conditional_download_hashes, conditional_download_sources
 from facefusion.filesystem import resolve_relative_path
-from facefusion.download import conditional_download
+from facefusion.thread_helper import conditional_thread_semaphore
+from facefusion.typing import Fps, InferencePool, ModelOptions, ModelSet, VisionFrame
+from facefusion.vision import count_video_frame_total, detect_video_fps, get_video_frame, read_image
 
-CONTENT_ANALYSER = None
-THREAD_LOCK : threading.Lock = threading.Lock()
-MODELS : Dict[str, ModelValue] =\
+MODEL_SET : ModelSet =\
 {
 	'open_nsfw':
 	{
-		'url': 'https://github.com/facefusion/facefusion-assets/releases/download/models/open_nsfw.onnx',
-		'path': resolve_relative_path('../.assets/models/open_nsfw.onnx')
+		'hashes':
+		{
+			'content_analyser':
+			{
+				'url': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/open_nsfw.hash',
+				'path': resolve_relative_path('../.assets/models/open_nsfw.hash')
+			}
+		},
+		'sources':
+		{
+			'content_analyser':
+			{
+				'url': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/open_nsfw.onnx',
+				'path': resolve_relative_path('../.assets/models/open_nsfw.onnx')
+			}
+		},
+		'size': (224, 224),
+		'mean': [ 104, 117, 123 ]
 	}
 }
 PROBABILITY_LIMIT = 0.80
-RATE_LIMIT = 5
+RATE_LIMIT = 10
 STREAM_COUNTER = 0
 
 
-def get_content_analyser() -> Any:
-	global CONTENT_ANALYSER
-
-	with THREAD_LOCK:
-		if CONTENT_ANALYSER is None:
-			model_path = MODELS.get('open_nsfw').get('path')
-			CONTENT_ANALYSER = onnxruntime.InferenceSession(model_path, providers = apply_execution_provider_options(facefusion.globals.execution_providers))
-	return CONTENT_ANALYSER
+def get_inference_pool() -> InferencePool:
+	model_sources = get_model_options().get('sources')
+	return inference_manager.get_inference_pool(__name__, model_sources)
 
 
-def clear_content_analyser() -> None:
-	global CONTENT_ANALYSER
+def clear_inference_pool() -> None:
+	inference_manager.clear_inference_pool(__name__)
 
-	CONTENT_ANALYSER = None
+
+def get_model_options() -> ModelOptions:
+	return MODEL_SET.get('open_nsfw')
 
 
 def pre_check() -> bool:
-	if not facefusion.globals.skip_download:
-		download_directory_path = resolve_relative_path('../.assets/models')
-		model_url = MODELS.get('open_nsfw').get('url')
-		conditional_download(download_directory_path, [ model_url ])
-	return True
+	download_directory_path = resolve_relative_path('../.assets/models')
+	model_hashes = get_model_options().get('hashes')
+	model_sources = get_model_options().get('sources')
+
+	return conditional_download_hashes(download_directory_path, model_hashes) and conditional_download_sources(download_directory_path, model_sources)
 
 
 def analyse_stream(vision_frame : VisionFrame, video_fps : Fps) -> bool:
@@ -62,21 +70,32 @@ def analyse_stream(vision_frame : VisionFrame, video_fps : Fps) -> bool:
 	return False
 
 
+def analyse_frame(vision_frame : VisionFrame) -> bool:
+	vision_frame = prepare_frame(vision_frame)
+	probability = forward(vision_frame)
+
+	return probability > PROBABILITY_LIMIT
+
+
+def forward(vision_frame : VisionFrame) -> float:
+	content_analyser = get_inference_pool().get('content_analyser')
+
+	with conditional_thread_semaphore():
+		probability = content_analyser.run(None,
+		{
+			'input': vision_frame
+		})[0][0][1]
+
+	return probability
+
+
 def prepare_frame(vision_frame : VisionFrame) -> VisionFrame:
-	vision_frame = cv2.resize(vision_frame, (224, 224)).astype(numpy.float32)
-	vision_frame -= numpy.array([ 104, 117, 123 ]).astype(numpy.float32)
+	model_size = get_model_options().get('size')
+	model_mean = get_model_options().get('mean')
+	vision_frame = cv2.resize(vision_frame, model_size).astype(numpy.float32)
+	vision_frame -= numpy.array(model_mean).astype(numpy.float32)
 	vision_frame = numpy.expand_dims(vision_frame, axis = 0)
 	return vision_frame
-
-
-def analyse_frame(vision_frame : VisionFrame) -> bool:
-	content_analyser = get_content_analyser()
-	vision_frame = prepare_frame(vision_frame)
-	probability = content_analyser.run(None,
-	{
-		'input:0': vision_frame
-	})[0][0][1]
-	return probability > PROBABILITY_LIMIT
 
 
 @lru_cache(maxsize = None)
@@ -93,7 +112,7 @@ def analyse_video(video_path : str, start_frame : int, end_frame : int) -> bool:
 	rate = 0.0
 	counter = 0
 
-	with tqdm(total = len(frame_range), desc = wording.get('analysing'), unit = 'frame', ascii = ' =', disable = facefusion.globals.log_level in [ 'warn', 'error' ]) as progress:
+	with tqdm(total = len(frame_range), desc = wording.get('analysing'), unit = 'frame', ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
 		for frame_number in frame_range:
 			if frame_number % int(video_fps) == 0:
 				frame = get_video_frame(video_path, frame_number)

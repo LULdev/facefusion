@@ -1,57 +1,32 @@
-from typing import List, Optional
-import glob
 import os
 import shutil
-import tempfile
-import filetype
 from pathlib import Path
+from typing import List, Optional
 
-import facefusion.globals
+import filetype
 
-TEMP_DIRECTORY_PATH = os.path.join(tempfile.gettempdir(), 'facefusion')
-TEMP_OUTPUT_VIDEO_NAME = 'temp.mp4'
+from facefusion.common_helper import is_windows
 
-
-def get_temp_frame_paths(target_path : str) -> List[str]:
-	temp_frames_pattern = get_temp_frames_pattern(target_path, '*')
-	return sorted(glob.glob(temp_frames_pattern))
+if is_windows():
+	import ctypes
 
 
-def get_temp_frames_pattern(target_path : str, temp_frame_prefix : str) -> str:
-	temp_directory_path = get_temp_directory_path(target_path)
-	return os.path.join(temp_directory_path, temp_frame_prefix + '.' + facefusion.globals.temp_frame_format)
+def get_file_size(file_path : str) -> int:
+	if is_file(file_path):
+		return os.path.getsize(file_path)
+	return 0
 
 
-def get_temp_directory_path(target_path : str) -> str:
-	target_name, _ = os.path.splitext(os.path.basename(target_path))
-	return os.path.join(TEMP_DIRECTORY_PATH, target_name)
+def same_file_extension(file_paths : List[str]) -> bool:
+	file_extensions : List[str] = []
 
+	for file_path in file_paths:
+		_, file_extension = os.path.splitext(file_path.lower())
 
-def get_temp_output_video_path(target_path : str) -> str:
-	temp_directory_path = get_temp_directory_path(target_path)
-	return os.path.join(temp_directory_path, TEMP_OUTPUT_VIDEO_NAME)
-
-
-def create_temp(target_path : str) -> None:
-	temp_directory_path = get_temp_directory_path(target_path)
-	Path(temp_directory_path).mkdir(parents = True, exist_ok = True)
-
-
-def move_temp(target_path : str, output_path : str) -> None:
-	temp_output_video_path = get_temp_output_video_path(target_path)
-	if is_file(temp_output_video_path):
-		if is_file(output_path):
-			os.remove(output_path)
-		shutil.move(temp_output_video_path, output_path)
-
-
-def clear_temp(target_path : str) -> None:
-	temp_directory_path = get_temp_directory_path(target_path)
-	parent_directory_path = os.path.dirname(temp_directory_path)
-	if not facefusion.globals.keep_temp and is_directory(temp_directory_path):
-		shutil.rmtree(temp_directory_path)
-	if os.path.exists(parent_directory_path) and not os.listdir(parent_directory_path):
-		os.rmdir(parent_directory_path)
+		if file_extensions and file_extension not in file_extensions:
+			return False
+		file_extensions.append(file_extension)
+	return True
 
 
 def is_file(file_path : str) -> bool:
@@ -60,6 +35,12 @@ def is_file(file_path : str) -> bool:
 
 def is_directory(directory_path : str) -> bool:
 	return bool(directory_path and os.path.isdir(directory_path))
+
+
+def in_directory(file_path : str) -> bool:
+	if file_path and not is_directory(file_path):
+		return is_directory(os.path.dirname(file_path))
+	return False
 
 
 def is_audio(audio_path : str) -> bool:
@@ -102,8 +83,58 @@ def resolve_relative_path(path : str) -> str:
 	return os.path.abspath(os.path.join(os.path.dirname(__file__), path))
 
 
+def sanitize_path_for_windows(full_path : str) -> Optional[str]:
+	buffer_size = 0
+
+	while True:
+		unicode_buffer = ctypes.create_unicode_buffer(buffer_size)
+		buffer_limit = ctypes.windll.kernel32.GetShortPathNameW(full_path, unicode_buffer, buffer_size) #type:ignore[attr-defined]
+
+		if buffer_size > buffer_limit:
+			return unicode_buffer.value
+		if buffer_limit == 0:
+			return None
+		buffer_size = buffer_limit
+
+
+def copy_file(file_path : str, move_path : str) -> bool:
+	if is_file(file_path):
+		shutil.copy(file_path, move_path)
+		return is_file(move_path)
+	return False
+
+
+def move_file(file_path : str, move_path : str) -> bool:
+	if is_file(file_path):
+		shutil.move(file_path, move_path)
+		return not is_file(file_path) and is_file(move_path)
+	return False
+
+
+def remove_file(file_path : str) -> bool:
+	if is_file(file_path):
+		os.remove(file_path)
+		return not is_file(file_path)
+	return False
+
+
+def create_directory(directory_path : str) -> bool:
+	if directory_path and not is_file(directory_path):
+		Path(directory_path).mkdir(parents = True, exist_ok = True)
+		return is_directory(directory_path)
+	return False
+
+
 def list_directory(directory_path : str) -> Optional[List[str]]:
 	if is_directory(directory_path):
 		files = os.listdir(directory_path)
-		return sorted([ Path(file).stem for file in files if not Path(file).stem.startswith(('.', '__')) ])
+		files = [ Path(file).stem for file in files if not Path(file).stem.startswith(('.', '__')) ]
+		return sorted(files)
 	return None
+
+
+def remove_directory(directory_path : str) -> bool:
+	if is_directory(directory_path):
+		shutil.rmtree(directory_path, ignore_errors = True)
+		return not is_directory(directory_path)
+	return False
